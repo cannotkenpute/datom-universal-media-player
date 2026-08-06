@@ -1,0 +1,48 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 1.11.1.1413
+          
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.0' # Matches the beta/stable requirements typically
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Compile ClojureDart
+        run: clojure -M:cljd compile
+
+      - name: Build macOS App
+        run: flutter build macos --release
+
+      - name: Upload Application
+        uses: actions/upload-artifact@v4
+        with:
+          name: cljd_datomworld-macos-app
+          path: build/macos/Build/Products/Release/*.app
+          retention-days: 7
