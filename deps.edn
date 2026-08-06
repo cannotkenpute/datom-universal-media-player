@@ -1,0 +1,21 @@
+{:paths ["src/cljc" "src/cljd"]
+ :cljd/opts {}
+ :aliases
+ {:test
+  {:extra-paths ["test"]
+   :extra-deps
+   {io.github.cognitect-labs/test-runner
+    {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts ["-m" "cognitect.test-runner"]}
+  :cljd
+  {:extra-paths ["test"]
+   :extra-deps
+   {tensegritics/clojuredart
+    {:git/url "https://github.com/tensegritics/ClojureDart.git"
+     :sha "81b5c03a55cf52b21dc0be8ccfa4827b9889f488"}}
+   :main-opts ["-m" "cljd.build"]
+   :cljd/opts {:kind :flutter :main datomworld.media.main}}
+  :kondo
+  {:extra-deps
+   {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}}
+   :main-opts ["-m" "clj-kondo.main"]}}}

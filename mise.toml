@@ -1,0 +1,31 @@
+[tools]
+java = ["21", "17"]
+cljstyle = "0.17.642"
+zprint = "1.3.0"
+babashka = "latest"
+clojure = "1.12.4.1602"
+node = "25.6.1"
+android-sdk = "latest"
+flutter = { version = "latest", platforms = """
+[linux-x64]
+url = "https://storage.googleapis.com/flutter_infra_release/releases/beta/linux/flutter_linux_{{ version }}-beta.tar.xz"
+
+[macos-arm64]
+url = "https://storage.googleapis.com/flutter_infra_release/releases/beta/macos/flutter_macos_arm64_{{ version }}-beta.zip"
+
+[macos-x64]
+url = "https://storage.googleapis.com/flutter_infra_release/releases/beta/macos/flutter_macos_{{ version }}-beta.zip"
+
+[windows-x64]
+url = "https://storage.googleapis.com/flutter_infra_release/releases/beta/windows/flutter_windows_{{ version }}-beta.zip"
+""", version_json_path = ".releases[?channel=beta].version", version_list_url = "https://storage.googleapis.com/flutter_infra_release/releases/releases_macos.json" }
+
+[env._]
+path = [
+  "{{env.HOME}}/.local/share/mise/installs/android-sdk/1.0/platform-tools",
+  "{{env.HOME}}/.local/share/mise/installs/android-sdk/1.0/emulator",
+]
+
+[env]
+#FLUTTER_STORAGE_BASE_URL = "https://storage.flutter-io.cn"
+#PUB_HOSTED_URL = "https://pub.flutter-io.cn"

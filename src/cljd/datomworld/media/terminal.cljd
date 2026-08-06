@@ -1,0 +1,488 @@
+(ns datomworld.media.terminal
+  "Flutter capability terminals. Browser files, mobile paths, Blob URLs and
+   payload bytes remain private to these closures."
+  (:require ["dart:core" :as core]
+            ["package:datom_universal_media_player/datom_media_bridge.dart" :as bridge]
+            [clojure.string :as str]
+            [dao.stream :as ds]
+            [datomworld.media.format :as media-format]))
+
+
+(defn- put!
+  [stream value]
+  (when stream (ds/put! stream value)))
+
+
+(defn- sanitize-name
+  [name]
+  (-> (or name "Untitled media")
+      (str/split #"[\\/]")
+      last
+      (str/replace #"[\u0000-\u001f\u007f]" "")))
+
+
+(defn- basename
+  [name]
+  (let [clean (sanitize-name name)
+        dot (.lastIndexOf clean ".")
+        base (if (pos? dot) (subs clean 0 dot) clean)]
+    (if (str/blank? base) "media" base)))
+
+
+(defn- invalid!
+  ([error] (invalid! error "Invalid datom media"))
+  ([error message]
+   (throw (ex-info message {:media/error error}))))
+
+
+(defn- bounded-end
+  [size start length]
+  (min size (+ start length)))
+
+
+(defn- verify-payload!
+  [^bridge/SourceCapability capability payload-offset expected-kind]
+  (-> ^core/Future
+      (.readRange capability
+                  payload-offset
+                  (bounded-end (.-size capability) payload-offset 12))
+      (.then
+        (fn [prefix]
+          (when-not (= expected-kind
+                       (media-format/signature-kind (vec prefix)))
+            (invalid! :signature-mismatch
+                      "Media signature disagrees with its manifest"))
+          true))))
+
+
+(defn- parse-container!
+  [^bridge/SourceCapability capability magic container]
+  (-> ^core/Future
+      (.readRange capability 0 media-format/header-size)
+      (.then
+        (fn [header]
+          (let [header-magic (bridge/decodeUtf8 (.sublist header 0 8))
+                manifest-length (bridge/littleEndianUint32 header 8)
+                payload-offset (+ media-format/header-size manifest-length)]
+            (when-not (= magic header-magic)
+              (invalid! :invalid-datom-media "Unknown datom media signature"))
+            (when (> manifest-length media-format/maximum-manifest-bytes)
+              (invalid! :manifest-too-large "Datom manifest is too large"))
+            (when (> payload-offset (.-size capability))
+              (invalid! :truncated-payload "Datom payload is truncated"))
+            (-> ^core/Future
+                (.readRange capability media-format/header-size payload-offset)
+                (.then
+                  (fn [manifest-bytes]
+                    (let [manifest
+                          (media-format/decode-manifest
+                            (bridge/decodeUtf8 manifest-bytes))
+                          version
+                          (media-format/manifest-value
+                            manifest :datom.media/version)
+                          metadata
+                          (if (= container :datom)
+                            (media-format/manifest->metadata manifest)
+                            (media-format/legacy-manifest->metadata
+                              container manifest))
+                          payload-size (- (.-size capability) payload-offset)]
+                      (when (and (some? version)
+                                 (not= media-format/version version))
+                        (invalid! :unsupported-format-version
+                                  "Unsupported .datom format version"))
+                      (when-not metadata
+                        (invalid! :invalid-manifest
+                                  "Datom manifest is not canonical"))
+                      (when-not (= payload-size (:media/size metadata))
+                        (invalid! :truncated-payload
+                                  "Payload length disagrees with its manifest"))
+                      (-> (verify-payload! capability
+                                           payload-offset
+                                           (:media/kind metadata))
+                          (.then
+                            (fn [_]
+                              (assoc metadata
+                                     :media/name
+                                     (sanitize-name (:media/name metadata))
+                                     :terminal/capability capability
+                                     :terminal/payload-offset payload-offset
+                                     :terminal/convertible?
+                                     (not= container :datom))))))))))))))
+
+
+(defn parse-source!
+  "Return a Future containing normalized metadata plus private terminal
+   capabilities. The caller must strip :terminal/* before stream emission."
+  [^bridge/SourceCapability capability]
+  (when (< (.-size capability) 1)
+    (invalid! :empty-file "The selected file is empty"))
+  (let [header-end (min media-format/header-size (.-size capability))]
+    (-> ^core/Future
+        (.readRange capability 0 header-end)
+        (.then
+          (fn [header]
+            (let [magic (when (<= 8 (count header))
+                          (bridge/decodeUtf8 (.sublist header 0 8)))
+                  container (media-format/container-for-magic magic)]
+              (case container
+                :datom (parse-container! capability
+                                         media-format/datom-magic
+                                         :datom)
+                :datmov (parse-container! capability
+                                          media-format/movie-magic
+                                          :datmov)
+                :datmus (parse-container! capability
+                                          media-format/music-magic
+                                          :datmus)
+                (let [name (sanitize-name (.-name capability))
+                      mime (or (.-mime capability) "")
+                      kind (media-format/conversion-kind name mime)
+                      signature (media-format/signature-kind (vec header))]
+                  (when-not kind
+                    (invalid! :unsupported-format
+                              "Only MP4, MP3, .datom and legacy datom media are supported"))
+                  (when-not (= kind signature)
+                    (invalid! :signature-mismatch
+                              "File extension, MIME and payload signature disagree"))
+                  {:media/name name
+                   :media/type (case kind
+                                 :video "video/mp4"
+                                 :audio "audio/mpeg")
+                   :media/size (.-size capability)
+                   :media/kind kind
+                   :media/container :native
+                   :terminal/capability capability
+                   :terminal/payload-offset 0
+                   :terminal/convertible? true}))))))))
+
+
+(defn create-source-terminal!
+  [{:keys [event-stream]}]
+  (let [bridge (bridge/createSourceBridge)
+        generation* (atom 0)
+        next-id* (atom 0)
+        entries* (atom {})
+        register!
+        (fn [capability generation selection-kind]
+          (-> (parse-source! capability)
+              (.then
+                (fn [parsed]
+                  (if (not= generation @generation*)
+                    (.dispose capability)
+                    (let [source-id (str "source-" (swap! next-id* inc))
+                          public
+                          (-> parsed
+                              (dissoc :terminal/capability
+                                      :terminal/payload-offset
+                                      :terminal/convertible?)
+                              (assoc :player.event/kind selection-kind
+                                     :media/source-id source-id
+                                     :media/source-generation generation))]
+                      (swap! entries* assoc source-id
+                             (assoc parsed
+                                    :media/source-id source-id
+                                    :media/source-generation generation))
+                      (put! event-stream public)
+                      public))))
+              (.catchError
+                (fn [error]
+                  (when (= generation @generation*)
+                    (put! event-stream
+                          (if (= selection-kind
+                                 :converter/source-selected)
+                            {:player.event/kind
+                             :converter/selection-failed
+                             :media/error
+                             (or (:media/error (ex-data error))
+                                 :invalid-datom-media)
+                             :media/error-detail (str error)}
+                            {:media.event/kind :error
+                             :media/error
+                             (or (:media/error (ex-data error))
+                                 :invalid-datom-media)})))
+                  nil))))
+        pick-for!
+        (fn [selection-kind]
+          (let [generation (swap! generation* inc)]
+            (-> (.pickSource bridge)
+                (.then
+                  (fn [capability]
+                    (when capability
+                      (register! capability generation selection-kind))))
+                (.catchError
+                  (fn [_]
+                    (put! event-stream
+                          (if (= selection-kind
+                                 :converter/source-selected)
+                            {:player.event/kind
+                             :converter/selection-failed
+                             :media/error :file-picker-failed}
+                            {:media.event/kind :error
+                             :media/error :file-picker-failed}))
+                    nil)))))]
+    (.installDropHandler
+      bridge
+      (fn [capability]
+        (register! capability (swap! generation* inc) :source-selected)))
+    {:pick! #(pick-for! :source-selected)
+     :pick-conversion! #(pick-for! :converter/source-selected)
+     :register! register!
+     :generation generation*
+     :resolve #(get @entries* %)
+     :prepare!
+     (fn [source-id generation]
+       (if-let [entry (get @entries* source-id)]
+         (if (= generation (:media/source-generation entry))
+           (-> (.preparePlayback
+                 ^bridge/SourceCapability (:terminal/capability entry)
+                 .payloadOffset (:terminal/payload-offset entry)
+                 .mime (:media/type entry)
+                 .kind (name (:media/kind entry)))
+               (.then #(.withGeneration % generation)))
+           (core/Future.error
+             (ex-info "Stale source generation"
+                      {:media/error :stale-source})))
+         (core/Future.error
+           (ex-info "Source capability unavailable"
+                    {:media/error :source-unavailable}))))
+     :convert!
+     (fn [source-id generation duration]
+       (if-let [entry (get @entries* source-id)]
+         (if (and (= generation (:media/source-generation entry))
+                  (:terminal/convertible? entry)
+                  (contains? #{:video :audio} (:media/kind entry))
+                  (media-format/conversion-kind
+                    (:media/name entry) (:media/type entry)))
+           (let [manifest
+                 (media-format/manifest-datoms
+                   {:media/name (:media/name entry)
+                    :media/type (:media/type entry)
+                    :media/size (:media/size entry)
+                    :media/duration-seconds duration})
+                 prefix
+                 (bridge/datomPrefix
+                   media-format/datom-magic
+                   (media-format/encode-manifest manifest))
+                 filename (str (basename (:media/name entry)) ".datom")]
+             (-> (.saveWrapped
+                   ^bridge/SourceCapability (:terminal/capability entry)
+                   .prefix prefix
+                   .payloadOffset (:terminal/payload-offset entry)
+                   .suggestedName filename)
+                 (.then
+                   (fn [saved]
+                     (when saved
+                       (put! event-stream
+                             {:player.event/kind :converter/file-converted
+                              :media/source-id source-id
+                              :media/source-generation generation
+                              :media/container :datom
+                              :media/name filename}))
+                     saved))))
+           (core/Future.error
+             (ex-info "Source cannot be converted to .datom"
+                      {:media/error :unsupported-format})))
+         (core/Future.error
+           (ex-info "Source capability unavailable"
+                    {:media/error :source-unavailable}))))
+     :dispose!
+     (fn []
+       (doseq [[_ entry] @entries*]
+         (.dispose ^bridge/SourceCapability (:terminal/capability entry)))
+       (reset! entries* {})
+       (.dispose bridge))}))
+
+
+(defn- dart-event->media-event
+  [generation->source event]
+  (let [kind (get event "kind")
+        generation (get event "sourceGeneration")
+        source-id (get @generation->source generation)
+        base {:media.event/kind (keyword kind)
+              :media/source-id source-id
+              :media/source-generation generation}]
+    (cond-> base
+      (get event "duration")
+      (assoc :media/duration-seconds (get event "duration"))
+      (get event "position")
+      (assoc :media/position-seconds (get event "position"))
+      (get event "width")
+      (assoc :media/width (get event "width"))
+      (get event "height")
+      (assoc :media/height (get event "height"))
+      (get event "buffered")
+      (assoc :media/buffered
+             (mapv (fn [range] (vec range)) (get event "buffered")))
+      (contains? event "volume")
+      (assoc :media/volume (get event "volume"))
+      (contains? event "muted")
+      (assoc :media/muted? (get event "muted"))
+      (get event "rate")
+      (assoc :media/rate (get event "rate"))
+      (get event "error")
+      (assoc :media/error (keyword (get event "error"))))))
+
+
+(defn create-media-terminal!
+  [{:keys [command-stream event-stream source-terminal]}]
+  (let [position* (atom 0)
+        generation->source* (atom {})
+        fullscreen (bridge/createFullscreenBridge)
+        host (bridge/createVideoPlayerHost
+               (fn [event]
+                 (put! event-stream
+                       (dart-event->media-event generation->source* event))))
+        fail!
+        (fn [command error detail]
+          (put! event-stream
+                (cond->
+                  {:media/source-id (:media/source-id command)
+                   :media/source-generation
+                   (:media/source-generation command)
+                   :media.command/id (:media.command/id command)
+                   :media.command/kind (:media.command/kind command)
+                   :media/error error
+                   :media/error-detail detail}
+                  (= :convert-source (:media.command/kind command))
+                  (assoc :player.event/kind :converter/failed)
+
+                  (not= :convert-source (:media.command/kind command))
+                  (assoc :media.event/kind :command-failed))))
+        invoke!
+        (fn [command future]
+          (when future
+            (.catchError
+              future
+              (fn [caught]
+                (fail! command
+                       (if (= :play (:media.command/kind command))
+                         :autoplay-blocked
+                         :media-command-failed)
+                       (str caught))
+                nil))))
+        handle!
+        (fn [command]
+          (case (:media.command/kind command)
+            :load-source
+            (let [generation (:media/source-generation command)
+                  source-id (:media/source-id command)]
+              (swap! generation->source* assoc generation source-id)
+              (-> ((:prepare! source-terminal) source-id generation)
+                  (.then (fn [prepared] (.load host prepared)))
+                  (.catchError
+                    (fn [error]
+                      (fail! command :source-unavailable (str error))
+                      nil))))
+
+            :play (invoke! command (.play host))
+            :pause (invoke! command (.pause host))
+            :seek (invoke! command
+                           (.seek host (:media/position-seconds command)))
+            :set-volume (invoke! command (.setVolume
+                                          host (:media/volume command)))
+            :set-muted (invoke! command (.setMuted
+                                         host (:media/muted? command)))
+            :set-rate (invoke! command (.setRate host (:media/rate command)))
+            :convert-source
+            (invoke! command
+                     ((:convert! source-terminal)
+                      (:media/source-id command)
+                      (:media/source-generation command)
+                      (:media/duration-seconds command)))
+            :request-fullscreen
+            (-> (.enter fullscreen)
+                (.then
+                  (fn [active?]
+                    (put! event-stream
+                          {:media.event/kind :fullscreen-change
+                           :media/source-id (:media/source-id command)
+                           :media/source-generation
+                           (:media/source-generation command)
+                           :media/fullscreen? active?})))
+                (.catchError
+                  (fn [error]
+                    (fail! command :fullscreen-denied (str error))
+                    nil)))
+            :exit-fullscreen
+            (-> (.exit fullscreen)
+                (.then
+                  (fn [active?]
+                    (put! event-stream
+                          {:media.event/kind :fullscreen-change
+                           :media/source-id (:media/source-id command)
+                           :media/source-generation
+                           (:media/source-generation command)
+                           :media/fullscreen? active?})))
+                (.catchError
+                  (fn [error]
+                    (fail! command :fullscreen-denied (str error))
+                    nil)))
+            :close-source (invoke! command (.close host))
+            nil))]
+    {:host host
+     :perform-fullscreen!
+     (fn [active? source]
+       (let [future (if active? (.exit fullscreen) (.enter fullscreen))]
+         (-> future
+             (.then
+               (fn [now-active?]
+                 (put! event-stream
+                       {:media.event/kind :fullscreen-change
+                        :media/source-id (:media/source-id source)
+                        :media/source-generation
+                        (:media/source-generation source)
+                        :media/fullscreen? now-active?})
+                 now-active?))
+             (.catchError
+               (fn [_]
+                 (put! event-stream
+                       {:media.event/kind :command-failed
+                        :media/source-id (:media/source-id source)
+                        :media/source-generation
+                        (:media/source-generation source)
+                        :media.command/kind
+                        (if active?
+                          :exit-fullscreen
+                          :request-fullscreen)
+                        :media/error :fullscreen-denied})
+                 nil)))))
+     :process!
+     (fn []
+       (loop []
+         (let [result (ds/next command-stream {:position @position*})]
+           (when (map? result)
+             (handle! (:ok result))
+             (swap! position* inc)
+             (recur)))))
+     :dispose! #(.dispose host)}))
+
+
+(defn create-settings-terminal!
+  [{:keys [event-stream command-stream]}]
+  (let [store (bridge/PlayerSettingsStore.)
+        position* (atom 0)]
+    {:load!
+     (fn []
+       (-> (.load store)
+           (.then
+             (fn [settings]
+               (put! event-stream
+                     {:player.event/kind :settings-loaded
+                      :settings/value
+                      {:player/volume (get settings "volume")
+                       :player/muted? (get settings "muted")
+                       :player/rate (get settings "rate")}})))))
+     :process!
+     (fn []
+       (loop []
+         (let [result (ds/next command-stream {:position @position*})]
+           (when (map? result)
+             (let [command (:ok result)
+                   value (:settings/value command)]
+               (when (= :save (:settings.command/kind command))
+                 (.save store
+                        (:player/volume value)
+                        (:player/muted? value)
+                        (:player/rate value))))
+             (swap! position* inc)
+             (recur)))))}))

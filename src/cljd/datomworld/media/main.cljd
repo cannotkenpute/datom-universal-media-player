@@ -1,0 +1,778 @@
+(ns datomworld.media.main
+  (:require ["dart:async" :as async]
+            ["dart:core" :as core]
+            ["package:flutter/material.dart" :as m]
+            ["package:flutter/services.dart" :as services]
+            [cljd.flutter :as f]
+            [dao.gui.event :as gui-event]
+            [dao.postgraphics.flutter :as pg]
+            [dao.stream :as ds]
+            [dao.stream.ringbuffer]
+            [datomworld.media.controller :as controller]
+            [datomworld.media.datom-log :as datom-log]
+            [datomworld.media.terminal :as terminal]
+            [datomworld.media.view :as media-view]))
+
+
+(defn- stream
+  []
+  (ds/open! {:type :ringbuffer
+             :capacity nil
+             :eviction-policy nil}))
+
+
+(defn- frame-stream
+  []
+  (ds/open! {:type :ringbuffer
+             :capacity 4
+             :eviction-policy :evict-oldest}))
+
+
+(defn- put!
+  [stream value]
+  (when stream (ds/put! stream value)))
+
+
+(defn- append-bounded
+  [values additions limit]
+  (let [combined (into (vec values) additions)
+        extra (- (count combined) limit)]
+    (if (pos? extra)
+      (subvec combined extra)
+      combined)))
+
+
+(defn- log-value!
+  [runtime origin value]
+  (let [transaction (swap! (:transaction runtime) inc)
+        datoms (datom-log/value->datoms transaction origin value)]
+    (swap! (:datoms runtime) append-bounded datoms 200)))
+
+
+(defn- render!
+  [runtime]
+  (when-let [[width height] @(:viewport runtime)]
+    (pg/put-frame!
+      (:frame-stream runtime)
+      (media-view/frame @(:state runtime)
+                        {:viewport-width width
+                         :viewport-height height}))))
+
+
+(defn- emit-event!
+  [runtime event]
+  (put! (:event-stream runtime) event))
+
+
+(defn- process-events!
+  [runtime]
+  (loop []
+    (let [result (ds/next (:event-stream runtime)
+                          {:position @(:event-position runtime)})]
+      (when (map? result)
+        (let [event (:ok result)
+              before @(:state runtime)
+              transition (controller/run-transition before event)
+              after (:state transition)]
+          (log-value! runtime :event event)
+          (swap! (:datoms runtime)
+                 append-bounded
+                 (datom-log/changes->datoms
+                   (swap! (:transaction runtime) inc)
+                   before
+                   after)
+                 200)
+          (doseq [command (:media-commands transition)]
+            (log-value! runtime :media-command command)
+            (put! (:media-command-stream runtime) command))
+          (doseq [command (:settings-commands transition)]
+            (log-value! runtime :settings-command command)
+            (put! (:settings-command-stream runtime) command))
+          (put! (:view-model-stream runtime) after)
+          (reset! (:state runtime) after)
+          (render! runtime))
+        (swap! (:event-position runtime) inc)
+        (recur)))))
+
+
+(defn- process-signals!
+  [runtime]
+  (loop []
+    (let [result (ds/next (:signal-stream runtime)
+                          {:position @(:signal-position runtime)})]
+      (when (map? result)
+        (log-value! runtime :runtime-signal (:ok result))
+        (swap! (:signal-position runtime) inc)
+        (recur)))))
+
+
+(defn- next-rate
+  [rate]
+  (cond
+    (< rate 0.75) 1.0
+    (< rate 1.25) 1.5
+    (< rate 1.75) 2.0
+    :else 0.5))
+
+
+(defn- seek-position
+  [runtime x]
+  (let [state @(:state runtime)
+        layout (media-view/layout
+                 state
+                 {:viewport-width (first @(:viewport runtime))
+                  :viewport-height (second @(:viewport runtime))})
+        start (+ (:controls/x layout) 16.0)
+        width (- (:controls/width layout) 32.0)
+        fraction (max 0.0 (min 1.0 (/ (- x start) width)))]
+    (* fraction (:player/duration-seconds state))))
+
+
+(defn- volume-position
+  [runtime x]
+  (let [state @(:state runtime)
+        layout (media-view/layout
+                 state
+                 {:viewport-width (first @(:viewport runtime))
+                  :viewport-height (second @(:viewport runtime))})
+        compact? (= :compact (:layout/mode layout))
+        start (+ (:controls/x layout) (if compact? 16.0 240.0))
+        width (if compact? 128.0 96.0)]
+    (max 0.0 (min 1.0 (/ (- x start) width)))))
+
+
+(defn- register-controls!
+  [runtime]
+  (let [gui (:gui-runtime runtime)
+        event! #(emit-event! runtime %)]
+    (gui-event/register!
+      gui :player/open-file :tap
+      (fn [_] ((:pick! (:source-terminal runtime)))))
+    (gui-event/register!
+      gui :player/play :tap
+      (fn [_] (event! {:player.event/kind :ui/play})))
+    (gui-event/register!
+      gui :player/pause :tap
+      (fn [_] (event! {:player.event/kind :ui/pause})))
+    (gui-event/register!
+      gui :player/mute :tap
+      (fn [_] (event! {:player.event/kind :ui/toggle-muted})))
+    (gui-event/register!
+      gui :player/rate :tap
+      (fn [_]
+        (event! {:player.event/kind :ui/set-rate
+                 :media/rate
+                 (next-rate (:player/rate @(:state runtime)))})))
+    (gui-event/register!
+      gui :player/fullscreen :tap
+      (fn [_]
+        ((:perform-fullscreen! (:media-terminal runtime))
+         (:player/fullscreen? @(:state runtime))
+         (:player/source @(:state runtime)))))
+    (gui-event/register!
+      gui :player/seek :tap
+      (fn [event]
+        (event! {:player.event/kind :ui/seek
+                 :media/position-seconds
+                 (seek-position runtime
+                                (get-in event [:position :x]))})))
+    (gui-event/register!
+      gui :player/volume :tap
+      (fn [event]
+        (event! {:player.event/kind :ui/set-volume
+                 :media/volume
+                 (volume-position runtime
+                                  (get-in event [:position :x]))})))))
+
+
+(defn- process-input!
+  [runtime]
+  (loop []
+    (let [result (ds/next (:input-stream runtime)
+                          {:position @(:input-position runtime)})]
+      (when (map? result)
+        (let [input (:ok result)
+              active-frame @(:active-frame-id (:gui-runtime runtime))]
+          (if (not= active-frame (:frame-id input))
+            (put! (:signal-stream runtime)
+                  {:diagnostic/kind :media/stale-input
+                   :severity :warning
+                   :frame-id (:frame-id input)
+                   :active-frame-id active-frame})
+            (log-value! runtime :input input)))
+        (swap! (:input-position runtime) inc)
+        (recur)))))
+
+
+(defn- create-runtime
+  []
+  (let [event-stream (stream)
+        media-command-stream (stream)
+        settings-command-stream (stream)
+        view-model-stream (stream)
+        frame-stream (frame-stream)
+        geometry-stream (stream)
+        tap-stream (stream)
+        input-stream (stream)
+        signal-stream (stream)
+        source-terminal
+        (terminal/create-source-terminal! {:event-stream event-stream})
+        media-terminal
+        (terminal/create-media-terminal!
+          {:command-stream media-command-stream
+           :event-stream event-stream
+           :source-terminal source-terminal})
+        settings-terminal
+        (terminal/create-settings-terminal!
+          {:event-stream event-stream
+           :command-stream settings-command-stream})
+        gui-runtime
+        (gui-event/create-runtime!
+          {:geometry-stream geometry-stream
+           :tap-stream tap-stream
+           :signal-stream signal-stream})
+        runtime
+        {:event-stream event-stream
+         :media-command-stream media-command-stream
+         :settings-command-stream settings-command-stream
+         :view-model-stream view-model-stream
+         :frame-stream frame-stream
+         :geometry-stream geometry-stream
+         :tap-stream tap-stream
+         :input-stream input-stream
+         :signal-stream signal-stream
+         :source-terminal source-terminal
+         :media-terminal media-terminal
+         :settings-terminal settings-terminal
+         :gui-runtime gui-runtime
+         :state (atom controller/initial-state)
+         :datoms (atom [])
+         :viewport (atom nil)
+         :inspector-open (atom true)
+         :transaction (atom 0)
+         :event-position (atom 0)
+         :input-position (atom 0)
+         :signal-position (atom 0)}]
+    (register-controls! runtime)
+    ((:load! settings-terminal))
+    (assoc runtime
+           :timer
+           (async/Timer.periodic
+             (core/Duration .milliseconds 16)
+             (fn [_]
+               (gui-event/process-pending! gui-runtime)
+               (process-input! runtime)
+               (process-events! runtime)
+               ((:process! media-terminal))
+               ((:process! settings-terminal))
+               (process-signals! runtime))))))
+
+
+(defn- dispose-runtime!
+  [runtime]
+  (.cancel ^async/Timer (:timer runtime))
+  (gui-event/dispose! (:gui-runtime runtime))
+  ((:dispose! (:media-terminal runtime)))
+  ((:dispose! (:source-terminal runtime)))
+  (doseq [stream-key
+          [:event-stream :media-command-stream :settings-command-stream
+           :view-model-stream :frame-stream :geometry-stream :tap-stream
+           :input-stream :signal-stream]]
+    (ds/close! (get runtime stream-key))))
+
+
+(defn- dispose-focus-node!
+  [^m/FocusNode focus-node]
+  (.dispose focus-node))
+
+
+(defn- keyboard-event!
+  [runtime event]
+  (when (instance? services/KeyDownEvent event)
+    (let [key (.-logicalKey event)
+          state @(:state runtime)
+          event! #(emit-event! runtime %)]
+      (cond
+        (or (= key services/LogicalKeyboardKey.space)
+            (= key services/LogicalKeyboardKey.keyK))
+        (event! {:player.event/kind :ui/toggle-play})
+
+        (= key services/LogicalKeyboardKey.arrowLeft)
+        (event! {:player.event/kind :ui/seek
+                 :media/position-seconds
+                 (- (:player/position-seconds state) 5.0)})
+
+        (= key services/LogicalKeyboardKey.arrowRight)
+        (event! {:player.event/kind :ui/seek
+                 :media/position-seconds
+                 (+ (:player/position-seconds state) 5.0)})
+
+        (= key services/LogicalKeyboardKey.arrowUp)
+        (event! {:player.event/kind :ui/set-volume
+                 :media/volume (+ (:player/volume state) 0.05)})
+
+        (= key services/LogicalKeyboardKey.arrowDown)
+        (event! {:player.event/kind :ui/set-volume
+                 :media/volume (- (:player/volume state) 0.05)})
+
+        (= key services/LogicalKeyboardKey.keyM)
+        (event! {:player.event/kind :ui/toggle-muted})
+
+        (= key services/LogicalKeyboardKey.keyF)
+        ((:perform-fullscreen! (:media-terminal runtime))
+         (:player/fullscreen? state)
+         (:player/source state))
+
+        (= key services/LogicalKeyboardKey.escape)
+        (when (:player/fullscreen? state)
+          ((:perform-fullscreen! (:media-terminal runtime))
+           true
+           (:player/source state)))
+
+        :else nil))))
+
+
+(defn- transparent-button
+  [label x y width height action]
+  (m/Positioned
+    .left x
+    .top y
+    .width width
+    .height height
+    .child
+    (m/Semantics
+      .button true
+      .label label
+      .onTap action
+      .child
+      (m/GestureDetector
+        .behavior m/HitTestBehavior.opaque
+        .onTap action
+        .child (m/Container .color (m/Color.fromARGB 0 0 0 0))))))
+
+
+(defn- semantic-overlays
+  [runtime width height]
+  (let [state @(:state runtime)
+        layout (media-view/layout
+                 state
+                 {:viewport-width width :viewport-height height})
+        compact? (= :compact (:layout/mode layout))
+        x (:controls/x layout)
+        y (:controls/y layout)
+        button-y (+ y (if compact? 78.0 54.0))
+        screen-button-y (- height button-y 38.0)
+        event! #(emit-event! runtime %)
+        source (:player/source state)]
+    [(transparent-button
+       "Open local media file"
+       (- width 132.0) 20.0 108.0 38.0
+       #((:pick! (:source-terminal runtime))))
+     (m/Positioned
+       .left (+ x 16.0)
+       .top (- height (+ y 44.0))
+       .width (- (:controls/width layout) 32.0)
+       .height 36.0
+       .child
+       (m/Semantics
+         .slider true
+         .label "Playback position"
+         .value
+         (str (media-view/format-time (:player/position-seconds state))
+              " of "
+              (media-view/format-time (:player/duration-seconds state)))
+         .onIncrease
+         #(event! {:player.event/kind :ui/seek
+                   :media/position-seconds
+                   (+ (:player/position-seconds state) 5.0)})
+         .onDecrease
+         #(event! {:player.event/kind :ui/seek
+                   :media/position-seconds
+                   (- (:player/position-seconds state) 5.0)})
+         .child (m/SizedBox.expand)))
+     (m/Positioned
+       .left (+ x 16.0)
+       .top screen-button-y
+       .width 224.0
+       .height 38.0
+       .child
+       (m/Semantics
+         .label "Playback controls"
+         .child (m/SizedBox.expand)))
+     (transparent-button
+       (if (:player/fullscreen? state)
+         "Exit fullscreen"
+         "Enter fullscreen")
+       (- (+ x (:controls/width layout)) 104.0)
+       (- height (+ button-y (if compact? 48.0 0.0)) 38.0)
+       88.0
+       38.0
+       #((:perform-fullscreen! (:media-terminal runtime))
+         (:player/fullscreen? state)
+         source))]))
+
+
+(defn- player-surface
+  [runtime focus-node]
+  (m/LayoutBuilder
+    .builder
+    (fn [_ ^m/BoxConstraints constraints]
+      (let [width (.-maxWidth constraints)
+            height (.-maxHeight constraints)
+            viewport [width height]]
+        (when (not= viewport @(:viewport runtime))
+          (reset! (:viewport runtime) viewport)
+          (render! runtime))
+        (m/KeyboardListener
+          .focusNode focus-node
+          .autofocus true
+          .onKeyEvent #(keyboard-event! runtime %)
+          .child
+          (m/Stack
+            .fit m/StackFit.expand
+            .children
+            (into
+              [(m/Container
+                 .color (m/Color.fromARGB 255 5 9 20)
+                 .child (.buildSurface
+                          (:host (:media-terminal runtime))))
+               (pg/postgraphics-widget
+                 (:frame-stream runtime)
+                 :signal-stream (:signal-stream runtime)
+                 :geometry-stream (:geometry-stream runtime)
+                 :tap-stream (:tap-stream runtime)
+                 :input-stream (:input-stream runtime)
+                 :viewport-size #(deref (:viewport runtime)))]
+              (remove nil?
+                      (semantic-overlays runtime width height)))))))))
+
+
+(defn- inspector
+  [runtime wide?]
+  (let [open? @(:inspector-open runtime)
+        datoms @(:datoms runtime)
+        panel (m/Container
+                .color (m/Color.fromARGB 255 8 13 27)
+                .child
+                (m/Column
+                  .crossAxisAlignment m/CrossAxisAlignment.stretch
+                  .children
+                  (vec
+                    (remove
+                      nil?
+                      [(m/Container
+                     .padding (m/EdgeInsets.symmetric
+                                .horizontal 12.0 .vertical 8.0)
+                     .color (m/Color.fromARGB 255 13 21 40)
+                     .child
+                     (m/Row
+                       .children
+                       (vec
+                         (remove
+                           nil?
+                           [(m/Expanded
+                          .child
+                          (m/Text
+                            "LIVE DATOM STREAM"
+                            .style
+                            (m/TextStyle
+                              .fontFamily "monospace"
+                              .fontSize 12.0
+                              .fontWeight m/FontWeight.bold
+                              .color (m/Color.fromARGB 255 91 198 255))))
+                        (when-not wide?
+                          (m/TextButton
+                            .onPressed
+                            #(swap! (:inspector-open runtime) not)
+                            .child
+                            (m/Text (if open? "Hide" "Show"))))]))))
+                   (when (or wide? open?)
+                     (m/Expanded
+                       .child
+                       (m/ListView.builder
+                         .reverse true
+                         .padding (m/EdgeInsets.all 10.0)
+                         .itemCount (count datoms)
+                         .itemBuilder
+                         (fn [_ index]
+                           (let [datom (nth datoms
+                                            (- (count datoms) index 1))]
+                             (m/Padding
+                               .padding
+                               (m/EdgeInsets.only .bottom 5.0)
+                               .child
+                               (m/Text
+                                 (pr-str datom)
+                                 .style
+                                 (m/TextStyle
+                                   .fontFamily "monospace"
+                                   .fontSize 10.5
+                                   .color
+                                   (m/Color.fromARGB
+                                     255 174 205 226)))))))))]))))]
+    (if wide?
+      (m/SizedBox .width 360.0 .child panel)
+      (m/SizedBox .height (if open? 180.0 44.0) .child panel))))
+
+
+(defn- tab-button
+  [label selected? action]
+  (m/Expanded
+    .child
+    (m/Semantics
+      .button true
+      .selected selected?
+      .label (str label " tab")
+      .child
+      (m/GestureDetector
+        .behavior m/HitTestBehavior.opaque
+        .onTap action
+        .child
+        (m/Container
+          .height 48.0
+          .decoration
+          (m/BoxDecoration
+            .color
+            (if selected?
+              (m/Color.fromARGB 255 34 93 140)
+              (m/Color.fromARGB 255 13 21 40))
+            .borderRadius (m/BorderRadius.circular 12.0)
+            .border
+            (m/Border.all
+              .color
+              (if selected?
+                (m/Color.fromARGB 255 91 198 255)
+                (m/Color.fromARGB 255 44 58 82))))
+          .child
+          (m/Center
+            .child
+            (m/Text
+              label
+              .style
+              (m/TextStyle
+                .fontSize 15.0
+                .fontWeight m/FontWeight.bold
+                .color
+                (if selected?
+                  (m/Color.fromARGB 255 238 249 255)
+                  (m/Color.fromARGB 255 174 190 214))))))))))
+
+
+(defn- app-tabs
+  [runtime]
+  (let [active (:app/active-tab @(:state runtime))
+        select! #(emit-event! runtime
+                              {:player.event/kind :ui/select-tab
+                               :app/tab %})]
+    (m/Container
+      .height 64.0
+      .padding (m/EdgeInsets.symmetric .horizontal 12.0 .vertical 8.0)
+      .color (m/Color.fromARGB 255 8 13 27)
+      .child
+      (m/Row
+        .children
+        [(tab-button "Player" (= active :player) #(select! :player))
+         (m/SizedBox .width 8.0)
+         (tab-button "Converter" (= active :converter)
+                     #(select! :converter))]))))
+
+
+(defn- converter-status-copy
+  [state]
+  (case (:converter/status state)
+    :ready "Ready to create a .datom file."
+    :converting "Creating your .datom file..."
+    :converted (str "Saved " (:converter/output-name state) ".")
+    :error
+    (case (:converter/error state)
+      :already-datom "This file is already in the .datom format."
+      :unsupported-format "Choose an MP4 or MP3 file."
+      :signature-mismatch "The file contents do not match its extension."
+      :file-picker-failed "The file picker could not be opened."
+      (or (:converter/error-detail state)
+          "The file could not be converted."))
+    "Choose an MP4 or MP3 file to begin."))
+
+
+(defn- converter-surface
+  [runtime]
+  (let [state @(:state runtime)
+        source (:converter/source state)
+        status (:converter/status state)
+        converting? (= :converting status)
+        can-convert? (and source
+                          (not= :datom (:media/container source))
+                          (not converting?))]
+    (m/Container
+      .color (m/Color.fromARGB 255 5 9 20)
+      .child
+      (m/SingleChildScrollView
+        .padding (m/EdgeInsets.symmetric .horizontal 20.0 .vertical 32.0)
+        .child
+        (m/Center
+          .child
+          (m/SizedBox
+            .width 680.0
+            .child
+            (m/Column
+              .crossAxisAlignment m/CrossAxisAlignment.start
+              .children
+              [(m/Text
+                 "Convert to .datom"
+                 .style
+                 (m/TextStyle
+                   .fontSize 30.0
+                   .fontWeight m/FontWeight.bold
+                   .color (m/Color.fromARGB 255 238 249 255)))
+               (m/SizedBox .height 10.0)
+               (m/Text
+                 "Wrap a local MP4 or MP3 in the DATOM1 container. The original media bytes remain unchanged and never leave your device."
+                 .style
+                 (m/TextStyle
+                   .fontSize 15.0
+                   .height 1.45
+                   .color (m/Color.fromARGB 255 174 190 214)))
+               (m/SizedBox .height 28.0)
+               (m/Container
+                 .width 680.0
+                 .padding (m/EdgeInsets.all 20.0)
+                 .decoration
+                 (m/BoxDecoration
+                   .color (m/Color.fromARGB 255 13 21 40)
+                   .border
+                   (m/Border.all
+                     .color (m/Color.fromARGB 255 44 58 82))
+                   .borderRadius (m/BorderRadius.circular 16.0))
+                 .child
+                 (m/Column
+                   .crossAxisAlignment m/CrossAxisAlignment.start
+                   .children
+                   (vec
+                     (remove
+                       nil?
+                       [(m/Text
+                      (if source "Selected file" "Source file")
+                      .style
+                      (m/TextStyle
+                        .fontSize 12.0
+                        .fontWeight m/FontWeight.bold
+                        .color (m/Color.fromARGB 255 91 198 255)))
+                    (m/SizedBox .height 8.0)
+                    (m/Text
+                      (or (:media/name source) "No file selected")
+                      .style
+                      (m/TextStyle
+                        .fontSize 18.0
+                        .fontWeight m/FontWeight.w600
+                        .color (m/Color.fromARGB 255 238 249 255)))
+                    (when source
+                      (m/Padding
+                        .padding (m/EdgeInsets.only .top 6.0)
+                        .child
+                        (m/Text
+                          (str (:media/type source) "  |  "
+                               (:media/size source) " bytes")
+                          .style
+                          (m/TextStyle
+                            .fontSize 13.0
+                            .color (m/Color.fromARGB 255 174 190 214)))))
+                    (m/SizedBox .height 20.0)
+                    (m/OutlinedButton
+                      .onPressed
+                      (when-not converting?
+                        #((:pick-conversion! (:source-terminal runtime))))
+                      .child
+                      (m/Text
+                        (if source
+                          "Choose another file"
+                          "Choose file")))]))))
+               (m/SizedBox .height 20.0)
+               (m/Text
+                 (converter-status-copy state)
+                 .style
+                 (m/TextStyle
+                   .fontSize 14.0
+                   .color
+                   (if (= status :error)
+                     (m/Color.fromARGB 255 255 113 119)
+                     (m/Color.fromARGB 255 174 205 226))))
+               (m/SizedBox .height 16.0)
+               (m/SizedBox
+                 .height 48.0
+                 .child
+                 (m/ElevatedButton
+                   .onPressed
+                   (when can-convert?
+                     #(emit-event!
+                        runtime
+                        {:player.event/kind :ui/converter-convert}))
+                   .child
+                   (m/Text (if converting?
+                             "Converting..."
+                             "Convert and download"))))])))))))
+
+
+(defn- player-app
+  []
+  (f/widget
+    :managed
+    [runtime (create-runtime)
+     :dispose dispose-runtime!
+     :refresh-on :never
+     focus-node (m/FocusNode.)
+     :dispose dispose-focus-node!
+     :refresh-on :never
+     state-value (:state runtime)
+     :dispose nil
+     :refresh-on :never
+     datom-value (:datoms runtime)
+     :dispose nil
+     :refresh-on :never
+     inspector-value (:inspector-open runtime)
+     :dispose nil
+     :refresh-on :never]
+    :watch
+    [_state state-value _datoms datom-value _inspector inspector-value]
+    (m/Scaffold
+      .body
+      (m/SafeArea
+        .child
+        (m/Column
+          .children
+          [(app-tabs runtime)
+           (m/Expanded
+             .child
+             (if (= :converter (:app/active-tab @(:state runtime)))
+               (converter-surface runtime)
+               (m/LayoutBuilder
+                 .builder
+                 (fn [_ ^m/BoxConstraints constraints]
+                   (let [wide? (>= (.-maxWidth constraints) 900.0)]
+                     (if wide?
+                       (m/Row
+                         .children
+                         [(m/Expanded
+                            .child (player-surface runtime focus-node))
+                          (inspector runtime true)])
+                       (m/Column
+                         .children
+                         [(m/Expanded
+                            .child (player-surface runtime focus-node))
+                          (inspector runtime false)])))))))])))))
+
+
+(defn main
+  []
+  (m/runApp
+    (m/MaterialApp
+      .debugShowCheckedModeBanner false
+      .title "Datom Universal Media Player"
+      .theme
+      (m/ThemeData
+        .brightness m/Brightness.dark
+        .scaffoldBackgroundColor (m/Color.fromARGB 255 5 9 20)
+        .colorScheme
+        (m/ColorScheme.fromSeed
+          .seedColor (m/Color.fromARGB 255 55 172 255)
+          .brightness m/Brightness.dark))
+      .home (player-app))))

@@ -1,0 +1,430 @@
+(ns dao.postgraphics.flutter
+  (:require ["dart:core" :as dart]
+            ["dart:typed_data" :as type]
+            ["dart:ui" :as ui]
+            ["package:flutter/material.dart" :as m]
+            [cljd.flutter :as f]
+            [dao.postgraphics.flutter.canvas :as canvas-render]
+            [dao.postgraphics.flutter.texture :as tex]
+            [dao.postgraphics.lowering :as lower]
+            [dao.postgraphics.math :as pmath]
+            [dao.postgraphics.terminal :as terminal]))
+
+
+(defn- ->f64-list
+  ^type/Float64List [args]
+  (let [^type/Float64List fl (type/Float64List. (count args))]
+    (loop [i 0
+           s (seq args)]
+      (if s (do (aset fl i (double (first s))) (recur (inc i) (next s))) fl))))
+
+
+;; Standard line-height multiplier per v3 §Line Height: a text run occupies a
+;; spatial block of `font-size × LINE_HEIGHT` anchored on the alphabetic
+;; baseline. Pinned on TextStyle/ParagraphStyle so behavior is
+;; host-independent.
+(def LINE_HEIGHT 1.2)
+
+
+(def GPU_RENDERER_POLICY
+  "Default Flutter submitter policy. The production widget uses Flutter GPU
+   for supported pipelines and falls back to software rendering for 3D draws
+   when navigator.gpu (or equivalent) is missing. Both paths light meshes with
+   the same Blinn-Phong model (the GPU shaders mirror raster/shade-mesh-fragment),
+   so scene data is authoritative and backend-agnostic."
+  {:canvas-fallback? true,
+   :software-renderer? true,
+   :gpu-lighting? true,
+   :texture-rendering? true,
+   :texture-source :flutter-gpu-texture,
+   :supported-pipelines #{:clear :camera-reset :mesh-3d :draw-3d :line-3d
+                          :draw-2d :text},
+   :supported-3d-ops #{:draw3d/mesh :draw3d/triangles :draw3d/lines}})
+
+
+(defn resolve-font-family
+  "Per v3 §Font Family Resolution: the VM cannot guarantee pixel-perfect
+   metric parity with an upstream measurement capability, so anything outside
+   the generic family set falls back to a System Monospace font where metrics
+   are strictly known and stable."
+  [requested]
+  (cond (nil? requested) "monospace"
+        (#{"monospace" "sans-serif" "serif"} requested) requested
+        :else "monospace"))
+
+
+(defn- ->paint
+  ^ui/Paint [color stroke?]
+  (let [paint (ui/Paint.)
+        [r g b a] (or color [0.0 0.0 0.0 1.0])]
+    (set! (.-color paint)
+          (m/Color.fromARGB (int (* 255.0 (double (or a 1.0))))
+                            (int (* 255.0 (double r)))
+                            (int (* 255.0 (double g)))
+                            (int (* 255.0 (double b)))))
+    (when stroke? (set! (.-style paint) ui/PaintingStyle.stroke))
+    paint))
+
+
+(defn- apply-clips!
+  [^ui/Canvas canvas clips]
+  (doseq [[x y w h] clips]
+    (.clipRect canvas
+               (ui/Rect.fromLTWH (double x) (double y) (double w) (double h)))))
+
+
+(defn- build-path
+  "Builds a ui.Path from a :draw/path :segments vector.  Segment vocabulary:
+   [:move-to x y] [:line-to x y] [:quad-to cx cy x y]
+   [:cubic-to cx1 cy1 cx2 cy2 x y] [:close]."
+  ^ui/Path [segments]
+  (let [path (ui/Path.)]
+    (doseq [seg segments]
+      (case (first seg)
+        :move-to (.moveTo path (double (nth seg 1)) (double (nth seg 2)))
+        :line-to (.lineTo path (double (nth seg 1)) (double (nth seg 2)))
+        :quad-to (.quadraticBezierTo path
+                                     (double (nth seg 1))
+                                     (double (nth seg 2))
+                                     (double (nth seg 3))
+                                     (double (nth seg 4)))
+        :cubic-to (.cubicTo path
+                            (double (nth seg 1))
+                            (double (nth seg 2))
+                            (double (nth seg 3))
+                            (double (nth seg 4))
+                            (double (nth seg 5))
+                            (double (nth seg 6)))
+        :close (.close path)
+        nil))
+    path))
+
+
+(defn- paint-2d-draw!
+  "Renders one :draw-2d op onto the 2D Canvas. Clips are applied in
+   screen-space (the lowering already y-flipped them); then the canvas is
+   y-flipped into the IR's Cartesian convention and the lowered model
+   matrix is applied so the op's own coordinates are used natively."
+  [^ui/Canvas canvas draw ^double height]
+  (let [op (:op draw)
+        kind (:op/kind op)
+        ;; The op draws under the model matrix; divide stroke widths by the
+        ;; screen-space x-scale so strokes stay constant in screen pixels
+        ;; under scale transforms.
+        sx (pmath/affine-scale-x (:model-m draw))
+        stroke-width (fn ^double [sw]
+                       (let [w (double sw)] (if (> sx 0.0) (/ w sx) w)))]
+    (.save canvas)
+    (apply-clips! canvas (:clips draw))
+    (.translate canvas 0.0 height)
+    (.scale canvas 1.0 -1.0)
+    (.transform canvas (->f64-list (:model-m draw)))
+    (case kind
+      (:draw/fill-rect :draw/stroke-rect)
+      (let [[x y w h] (:rect op)
+            stroke? (= kind :draw/stroke-rect)
+            ^ui/Paint p (->paint (:color op) stroke?)]
+        (when-let [sw (:stroke-width op)]
+          (set! (.-strokeWidth p) (stroke-width sw)))
+        (.drawRect
+          canvas
+          (ui/Rect.fromLTWH (double x) (double y) (double w) (double h))
+          p))
+      (:draw/fill-circle :draw/stroke-circle)
+      (let [[cx cy] (:center op)
+            stroke? (= kind :draw/stroke-circle)
+            ^ui/Paint p (->paint (:color op) stroke?)]
+        (when-let [sw (:stroke-width op)]
+          (set! (.-strokeWidth p) (stroke-width sw)))
+        (.drawCircle canvas
+                     (ui/Offset. (double cx) (double cy))
+                     (double (:radius op))
+                     p))
+      :draw/path (let [path (build-path (:segments op))]
+                   (when-let [fill (:fill op)]
+                     (.drawPath canvas path (->paint fill false)))
+                   (when-let [stroke (:stroke op)]
+                     (let [^ui/Paint p (->paint stroke true)]
+                       (set! (.-strokeWidth p)
+                             (stroke-width (get op :stroke-width 1.0)))
+                       (.drawPath canvas path p))))
+      :draw/image
+      (let [[x y w h] (:rect op)
+            opacity (double (get op :opacity 1.0))
+            resource (:resource op)]
+        (cond
+          ;; Placeholder: flat white fill honouring :opacity.
+          (= :placeholder (:resource/kind resource))
+          (.drawRect
+            canvas
+            (ui/Rect.fromLTWH (double x) (double y) (double w) (double h))
+            (->paint [1.0 1.0 1.0 opacity] false))
+          ;; Real image: map the source sub-rect into the dst rect under
+          ;; :image/fit, then paint with an ImageShader whose 4x4 matrix
+          ;; maps destination (screen) pixels back to source pixels.
+          ;; TileMode.clamp realizes source-coordinate clamping; the
+          ;; optional ColorFilter modulates :opacity (skipped at opacity
+          ;; 1.0).
+          (instance? ui/Image resource)
+          (let [^ui/Image img resource
+                img-w (double (.-width img))
+                img-h (double (.-height img))
+                fit (get op :image/fit :fill)
+                src (get op :image/src-rect [0.0 0.0 img-w img-h])
+                [dst-x dst-y dst-w dst-h src-x src-y src-w src-h]
+                (pmath/image-fit-rect fit [x y w h] src)
+                scale-x (/ (double src-w) (double dst-w))
+                scale-y (/ (double src-h) (double dst-h))
+                trans-x (- (double src-x) (* (double dst-x) scale-x))
+                trans-y (- (double src-y) (* (double dst-y) scale-y))
+                shader-mat (->f64-list [scale-x 0.0 0.0 0.0 0.0 scale-y 0.0
+                                        0.0 0.0 0.0 1.0 0.0 trans-x trans-y
+                                        0.0 1.0])
+                shader (ui/ImageShader. img
+                                        ui/TileMode.clamp
+                                        ui/TileMode.clamp
+                                        shader-mat)
+                paint (ui/Paint.)]
+            (set! (.-shader paint) shader)
+            (set! (.-filterQuality paint) ui/FilterQuality.low)
+            (when (< opacity 1.0)
+              (set! (.-colorFilter paint)
+                    (ui/ColorFilter.matrix
+                      (->f64-list [1.0 0.0 0.0 0.0 0.0 0.0 1.0 0.0 0.0 0.0
+                                   0.0 0.0 1.0 0.0 0.0 0.0 0.0 0.0 opacity
+                                   0.0]))))
+            (.drawRect canvas
+                       (ui/Rect.fromLTWH (double dst-x)
+                                         (double dst-y)
+                                         (double dst-w)
+                                         (double dst-h))
+                       paint))
+          :else nil))
+      nil)
+    (.restore canvas)))
+
+
+(defn text-baseline-offset
+  "Vertical draw offset for drawParagraph so the laid-out paragraph's
+   alphabetic baseline rests exactly at screen-y.  A Paragraph's anchor is the
+   top of its first line, so we shift up by the measured baseline:
+   (screen-y - alphabetic-baseline)."
+  ^double [^double screen-y ^double alphabetic-baseline]
+  (- screen-y alphabetic-baseline))
+
+
+(defn text-render-fields
+  [draw]
+  {:text (str (:text draw)),
+   :color (or (:color draw) [0.0 0.0 0.0 1.0]),
+   :font-size (double (get draw :font-size 14.0)),
+   :font-family (or (:font-family draw) "monospace"),
+   :screen-x (:screen-x draw),
+   :screen-y (:screen-y draw)})
+
+
+(defn- paint-text!
+  "Renders one :text op. screen-x/screen-y are already in y-down screen
+   space (pre-flipped by the lowering); shifted up by the laid-out
+   paragraph's alphabetic baseline so the baseline rests exactly at screen-y
+   (Paragraph's natural anchor is the top of the first line, not the
+   baseline). Using the true metric avoids the font-size approximation."
+  [^ui/Canvas canvas draw]
+  (let [{:keys [text color font-size font-family screen-x screen-y]}
+        (text-render-fields draw)
+        [r g b a] color
+        text-color (m/Color.fromARGB (int (* 255.0 (double (or a 1.0))))
+                                     (int (* 255.0 (double r)))
+                                     (int (* 255.0 (double g)))
+                                     (int (* 255.0 (double b))))
+        builder
+        (ui/ParagraphBuilder.
+          (ui/ParagraphStyle. .fontSize font-size .fontFamily font-family))]
+    (.pushStyle builder (ui/TextStyle. .color text-color))
+    (.addText builder text)
+    (let [^ui/Paragraph para (.build builder)]
+      (.layout para (ui/ParagraphConstraints. .width 1.0e6))
+      (.save canvas)
+      (apply-clips! canvas (:clips draw))
+      (.drawParagraph canvas
+                      para
+                      (ui/Offset. (double screen-x)
+                                  (text-baseline-offset (double screen-y)
+                                                        (.-alphabeticBaseline
+                                                          para))))
+      (.restore canvas))))
+
+
+(deftype PostgraphicsPainter
+  [frame* image-holder decoding? frame-seq*
+   rendered-seq*]
+  :extends
+  m/CustomPainter
+
+  (paint
+    [_this ^ui/Canvas canvas ^m/Size size]
+    (let [frame @frame*
+          ^double width (.-width size)
+          ^double height (.-height size)]
+      (when (seq frame)
+        (try (let [lowered (lower/lower-frame
+                             frame
+                             {:viewport-width width,
+                              :viewport-height height,
+                              :supports-render-targets? false,
+                              :supports-image? false,
+                              :texture-source-valid?
+                              (fn [s]
+                                (instance? tex/PgTexture s))})]
+               (canvas-render/paint-3d! canvas
+                                         lowered
+                                         width
+                                         height
+                                         image-holder
+                                         decoding?
+                                         frame-seq*
+                                         rendered-seq*)
+               (doseq [pass (:passes lowered)
+                       draw (:draws pass)]
+                 (case (:pipeline draw)
+                   :draw-2d (paint-2d-draw! canvas draw height)
+                   :text (paint-text! canvas draw)
+                   nil)))
+             (catch Object e (dart/print (str "Paint failed: " e)))))))
+
+
+  (shouldRepaint [_this _old] true))
+
+
+;; --- stream wiring ---
+
+(def put-frame! terminal/put-frame!)
+
+
+(defn- close-binding!
+  [binding]
+  ((:close! binding)))
+
+
+(defn- frame-stream-widget
+  "Returns a Flutter widget that renders frames emitted by frame-stream.
+
+   All per-demo state lives in the widget's State (via cljd.flutter/widget's
+   :managed bindings), so it survives parent rebuilds (resize/LayoutBuilder)
+   instead of being recreated — and the stream reader is closed on dispose
+   rather than leaked.  State:
+     frame*        latest frame the painter renders
+     frame-seq*    monotonic id bumped per accepted frame (the change signal)
+     rendered-seq* the frame-seq the software path last rasterized
+     image-holder  last decoded ui.Image (software path)
+     decoding?     in-flight guard for the async decode
+
+   Repaints are driven by :watch:
+     - frame-seq* changes every accepted frame, so a static scene (whose frames
+       are value-equal and would be swallowed by a ValueNotifier's == dedup)
+       still rebuilds and rasterizes.
+     - image-holder changes when an async decode lands, so the freshly decoded
+       image is painted even if the frame stream has since paused.  The
+       seq guard in paint-3d! stops that decode-triggered repaint from kicking
+       a redundant re-render."
+  [frame-stream & {:keys [on-error signal-stream geometry-stream tap-stream
+                          input-stream viewport-size]}]
+  (f/widget
+    :managed
+    [frame* (atom []) :dispose nil :refresh-on :never frame-seq* (atom 0)
+     :dispose nil :refresh-on :never rendered-seq* (atom -1) :dispose nil
+     :refresh-on :never image-holder (atom nil) :dispose nil :refresh-on :never
+     decoding? (atom false) :dispose nil :refresh-on :never _binding
+     (terminal/bind-stream!
+       frame-stream
+       {:validate-frame! #(lower/validate-frame!
+                            %
+                            {:supports-render-targets? false,
+                             :supports-image? false,
+                             :texture-source-valid?
+                             (fn [s]
+                               (instance? tex/PgTexture s))}),
+        :present-frame!
+        (fn [frame]
+          (reset! frame* frame)
+          (swap! frame-seq* inc)
+          (when-let [[width height] (when viewport-size (viewport-size))]
+            (let [lowered
+                  (lower/lower-frame
+                    frame
+                    {:viewport-width width
+                     :viewport-height height
+                     :supports-render-targets? false
+                     :supports-image? false
+                     :texture-source-valid?
+                     (fn [s]
+                       (instance? tex/PgTexture s))})]
+              (terminal/geometry-from-report
+                (:geometry-report lowered))))),
+        :signal-stream signal-stream,
+        :geometry-stream geometry-stream,
+        :tap-stream tap-stream,
+        :input-stream input-stream,
+        :on-error (or on-error
+                      (fn [e]
+                        (dart/print (str "Invalid frame rejected ("
+                                         (name (terminal/rejection-reason e))
+                                         "): " e))))}) :dispose close-binding!
+     :refresh-on :never]
+    :watch
+    [_frame-seq frame-seq* _image image-holder]
+    (let [position
+          (fn [event]
+            (let [p (.-localPosition event)]
+              {:x (.-dx p) :y (.-dy p)}))
+          input!
+          (fn [kind event]
+            ((:accept-input! _binding)
+             {:input.event/kind kind
+              :pointer/id (.-pointer event)
+              :position (position event)}))]
+      (m/GestureDetector
+        .behavior
+        m/HitTestBehavior.translucent
+        .onTapDown
+        (fn [event]
+          ((:accept-tap! _binding) (position event)))
+        .child
+        (m/Listener
+          .behavior
+          m/HitTestBehavior.translucent
+          .onPointerDown
+          #(input! :pointer/down %)
+          .onPointerMove
+          #(input! :pointer/move %)
+          .onPointerUp
+          #(input! :pointer/up %)
+          .onPointerCancel
+          #(input! :pointer/cancel %)
+          .child
+          (m/CustomPaint. .painter
+                          (PostgraphicsPainter. frame*
+                                                image-holder
+                                                decoding?
+                                                frame-seq*
+                                                rendered-seq*)))))))
+
+
+(defn postgraphics-widget
+  "Returns a Flutter widget that renders dao.postgraphics frame programs from
+  frame-stream.
+
+  Options:
+  - :on-error      callback receiving the exception when a frame is rejected
+  - :signal-stream dao.stream to which canonical terminal signals
+                   (:dao.terminal/reset, :dao.terminal/rejection) are emitted;
+                   required for participants in dao.gui.event"
+  [frame-stream & {:keys [on-error signal-stream geometry-stream tap-stream
+                          input-stream viewport-size]}]
+  (frame-stream-widget frame-stream
+                       :on-error on-error
+                       :signal-stream signal-stream
+                       :geometry-stream geometry-stream
+                       :tap-stream tap-stream
+                       :input-stream input-stream
+                       :viewport-size viewport-size))

@@ -1,0 +1,8 @@
+{:files {:extensions #{"blog" "chp" "clj" "cljc" "cljd" "cljs" "edn"},
+         :ignore #{".cpcache" ".git" ".shadow-cljs" "node_modules" "target"}},
+ :rules {:blank-lines {:enabled? true, :max-consecutive 2},
+         :eof-newline {:enabled? true},
+         :indentation {:enabled? true},
+         :namespaces {:enabled? true},
+         :whitespace
+           {:enabled? true, :insert-missing? true, :remove-trailing? true}}}
